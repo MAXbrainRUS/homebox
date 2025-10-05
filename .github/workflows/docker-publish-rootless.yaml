@@ -20,7 +20,7 @@ permissions:
 
 env:
   DOCKERHUB_REPO: sysadminsmedia/homebox
-  GHCR_REPO: ghcr.io/${{ github.repository | lower }}
+  GHCR_REPO: ${{ format('ghcr.io/{0}', toLower(github.repository)) }}
 
 jobs:
   build:
