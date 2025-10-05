@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"image"
 	"io"
@@ -530,14 +531,15 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 
 	log.Debug().Msg("detecting content type of original file")
 	contentType := http.DetectContentType(contentBytes[:min(512, len(contentBytes))])
+	titleLower := strings.ToLower(title)
 
 	if contentType == "application/octet-stream" {
 		switch {
-		case strings.HasSuffix(title, ".heic") || strings.HasSuffix(title, ".heif"):
+		case strings.HasSuffix(titleLower, ".heic") || strings.HasSuffix(titleLower, ".heif"):
 			contentType = "image/heic"
-		case strings.HasSuffix(title, ".avif"):
+		case strings.HasSuffix(titleLower, ".avif"):
 			contentType = "image/avif"
-		case strings.HasSuffix(title, ".jxl"):
+		case strings.HasSuffix(titleLower, ".jxl"):
 			contentType = "image/jxl"
 		}
 	}
@@ -556,7 +558,7 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 			return err
 		}
 		log.Debug().Msg("reading original file orientation")
-		imageMeta, err := imagemeta.Decode(bytes.NewReader(contentBytes))
+		orientation, err := readImageOrientation(contentBytes)
 		if err != nil {
 			log.Err(err).Msg("failed to decode original file content")
 			err := tx.Rollback()
@@ -565,7 +567,6 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 			}
 			return err
 		}
-		orientation := uint16(imageMeta.Orientation)
 		thumbnailPath, err := r.processThumbnailFromImage(ctx, groupId, img, title, orientation)
 		if err != nil {
 			err := tx.Rollback()
@@ -587,7 +588,7 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 			return err
 		}
 		log.Debug().Msg("reading original file orientation")
-		imageMeta, err := imagemeta.Decode(bytes.NewReader(contentBytes))
+		orientation, err := readImageOrientation(contentBytes)
 		if err != nil {
 			log.Err(err).Msg("failed to decode original file content")
 			err := tx.Rollback()
@@ -596,7 +597,6 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 			}
 			return err
 		}
-		orientation := uint16(imageMeta.Orientation)
 		thumbnailPath, err := r.processThumbnailFromImage(ctx, groupId, img, title, orientation)
 		if err != nil {
 			err := tx.Rollback()
@@ -630,7 +630,7 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 		log.Debug().Msg("creating thumbnail for heic file")
 		img, err := heic.Decode(bytes.NewReader(contentBytes))
 		if err != nil {
-			log.Err(err).Msg("failed to decode avif image")
+			log.Err(err).Msg("failed to decode heic image")
 			err := tx.Rollback()
 			if err != nil {
 				return err
@@ -638,16 +638,19 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 			return err
 		}
 		log.Debug().Msg("reading original file orientation")
-		imageMeta, err := imagemeta.Decode(bytes.NewReader(contentBytes))
+		orientation, err := readImageOrientation(contentBytes)
 		if err != nil {
-			log.Err(err).Msg("failed to decode original file content")
-			err := tx.Rollback()
-			if err != nil {
+			if errors.Is(err, imagemeta.ErrMetadataNotSupported) || errors.Is(err, imagemeta.ErrNoExif) {
+				log.Warn().Err(err).Msg("using default orientation for heic file")
+			} else {
+				log.Err(err).Msg("failed to decode original file content")
+				err := tx.Rollback()
+				if err != nil {
+					return err
+				}
 				return err
 			}
-			return err
 		}
-		orientation := uint16(imageMeta.Orientation)
 		thumbnailPath, err := r.processThumbnailFromImage(ctx, groupId, img, title, orientation)
 		if err != nil {
 			err := tx.Rollback()
@@ -838,6 +841,21 @@ func calculateThumbnailDimensions(origWidth, origHeight, maxWidth, maxHeight int
 	}
 
 	return newWidth, newHeight
+}
+
+func readImageOrientation(contentBytes []byte) (uint16, error) {
+	const defaultOrientation = uint16(1)
+
+	imageMeta, err := imagemeta.Decode(bytes.NewReader(contentBytes))
+	if err != nil {
+		return defaultOrientation, err
+	}
+
+	if imageMeta.Orientation == 0 {
+		return defaultOrientation, nil
+	}
+
+	return uint16(imageMeta.Orientation), nil
 }
 
 // processThumbnailFromImage handles the common thumbnail processing logic after image decoding
