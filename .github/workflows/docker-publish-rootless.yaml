@@ -31,7 +31,7 @@ jobs:
       id-token: write
       attestations: write
     env:
-      PUSH_TO_DOCKERHUB: ${{ fromJson(toJson(inputs.push_to_dockerhub)) ? 'true' : 'false' }}
+      PUSH_TO_DOCKERHUB: ${{ inputs.push_to_dockerhub && 'true' || 'false' }}
       CUSTOM_TAG: ${{ inputs.custom_tag }}
 
     strategy:
@@ -146,7 +146,7 @@ jobs:
     needs:
       - build
     env:
-      PUSH_TO_DOCKERHUB: ${{ fromJson(toJson(inputs.push_to_dockerhub)) ? 'true' : 'false' }}
+      PUSH_TO_DOCKERHUB: ${{ inputs.push_to_dockerhub && 'true' || 'false' }}
       CUSTOM_TAG: ${{ inputs.custom_tag }}
 
     steps:
