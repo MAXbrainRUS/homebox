@@ -179,6 +179,9 @@ jobs:
           driver-opts: |
             image=ghcr.io/amitie10g/buildkit:master
 
+      - name: Set lowercase GHCR repository
+        run: echo "GHCR_REPO=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
