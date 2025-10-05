@@ -20,7 +20,6 @@ permissions:
 
 env:
   DOCKERHUB_REPO: sysadminsmedia/homebox
-  GHCR_REPO: ${{ format('ghcr.io/{0}', lower(github.repository)) }}
 
 jobs:
   build:
@@ -51,6 +50,9 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set lowercase GHCR repository
+        run: echo "GHCR_REPO=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Prepare
         run: |
