@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adrium/goheif/heif"
+	"github.com/adrium/goheif/heif/bmff"
 	"github.com/evanoberholster/imagemeta"
 	"github.com/gen2brain/avif"
 	"github.com/gen2brain/heic"
@@ -847,15 +849,99 @@ func readImageOrientation(contentBytes []byte) (uint16, error) {
 	const defaultOrientation = uint16(1)
 
 	imageMeta, err := imagemeta.Decode(bytes.NewReader(contentBytes))
+	if err == nil {
+		if imageMeta.Orientation == 0 {
+			return defaultOrientation, nil
+		}
+
+		return uint16(imageMeta.Orientation), nil
+	}
+
+	if orientation, heicErr := readHeicOrientation(contentBytes); heicErr == nil {
+		return orientation, nil
+	}
+
+	return defaultOrientation, err
+}
+
+func readHeicOrientation(contentBytes []byte) (uint16, error) {
+	const defaultOrientation = uint16(1)
+
+	reader := bytes.NewReader(contentBytes)
+	file := heif.Open(reader)
+
+	item, err := file.PrimaryItem()
 	if err != nil {
-		return defaultOrientation, err
+		return 0, err
 	}
 
-	if imageMeta.Orientation == 0 {
-		return defaultOrientation, nil
+	rotation, hasRotation, mirrorAxis, hasMirror := extractHeifOrientationProps(item)
+	if !hasRotation && !hasMirror {
+		return defaultOrientation, fmt.Errorf("heic orientation metadata not found")
 	}
 
-	return uint16(imageMeta.Orientation), nil
+	return mapHeifOrientation(rotation, mirrorAxis, hasMirror), nil
+}
+
+func extractHeifOrientationProps(item *heif.Item) (rotation int, hasRotation bool, mirrorAxis int, hasMirror bool) {
+	for _, property := range item.Properties {
+		switch prop := property.(type) {
+		case *bmff.ImageRotation:
+			rotation = int(prop.Angle & 3)
+			hasRotation = true
+		case *bmff.ImageMirror:
+			mirrorAxis = int(prop.Mirror & 1)
+			hasMirror = true
+		}
+	}
+
+	return rotation % 4, hasRotation, mirrorAxis, hasMirror
+}
+
+func mapHeifOrientation(rotation int, mirrorAxis int, hasMirror bool) uint16 {
+	rotation = ((rotation % 4) + 4) % 4
+
+	if !hasMirror {
+		switch rotation {
+		case 0:
+			return 1
+		case 1:
+			return 8
+		case 2:
+			return 3
+		case 3:
+			return 6
+		default:
+			return 1
+		}
+	}
+
+	switch mirrorAxis {
+	case 0:
+		switch rotation {
+		case 0:
+			return 2
+		case 1:
+			return 7
+		case 2:
+			return 4
+		case 3:
+			return 5
+		}
+	case 1:
+		switch rotation {
+		case 0:
+			return 4
+		case 1:
+			return 5
+		case 2:
+			return 2
+		case 3:
+			return 7
+		}
+	}
+
+	return 1
 }
 
 // processThumbnailFromImage handles the common thumbnail processing logic after image decoding

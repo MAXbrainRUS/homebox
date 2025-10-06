@@ -6,6 +6,7 @@ toolchain go1.24.3
 
 require (
 	entgo.io/ent v0.14.5
+	github.com/adrium/goheif v0.0.0-20230113233934-ca402e77a786
 	github.com/ardanlabs/conf/v3 v3.8.0
 	github.com/containrrr/shoutrrr v0.8.0
 	github.com/evanoberholster/imagemeta v0.3.1
@@ -163,6 +164,7 @@ require (
 	github.com/rabbitmq/amqp091-go v1.10.0 // indirect
 	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/rwcarlsen/goexif v0.0.0-20190401172101-9e8deecbddbd // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.5.0 // indirect
 	github.com/swaggo/files/v2 v2.0.2 // indirect
