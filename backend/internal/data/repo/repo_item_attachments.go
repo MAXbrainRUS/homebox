@@ -22,6 +22,7 @@ import (
 	"github.com/gen2brain/heic"
 	"github.com/gen2brain/jpegxl"
 	"github.com/gen2brain/webp"
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog/log"
 	"github.com/sysadminsmedia/homebox/backend/internal/data/ent/group"
 	"github.com/sysadminsmedia/homebox/backend/internal/sys/config"
@@ -826,10 +827,15 @@ func isImageFile(mimetype string) bool {
 }
 
 func saveAttachmentWithRetry(ctx context.Context, builder func() *ent.AttachmentCreate) (*ent.Attachment, error) {
-	const maxAttachmentSaveRetries = 5
-	const retryDelay = 50 * time.Millisecond
+	const (
+		maxAttachmentSaveRetries = 9
+		initialRetryDelay        = 75 * time.Millisecond
+		maxRetryDelay            = 600 * time.Millisecond
+	)
 
+	delay := initialRetryDelay
 	var lastErr error
+
 	for attempt := 0; attempt < maxAttachmentSaveRetries; attempt++ {
 		attachmentDb, err := builder().Save(ctx)
 		if err == nil {
@@ -838,23 +844,50 @@ func saveAttachmentWithRetry(ctx context.Context, builder func() *ent.Attachment
 		if !isSQLiteBusy(err) {
 			return nil, err
 		}
+
 		lastErr = err
-		log.Warn().Err(err).Int("attempt", attempt+1).Msg("retrying attachment save due to sqlite busy")
-		backoff := retryDelay * time.Duration(attempt+1)
-		timer := time.NewTimer(backoff)
+		log.Warn().Err(err).
+			Int("attempt", attempt+1).
+			Dur("next_delay", delay).
+			Msg("retrying attachment save due to sqlite busy")
+
+		if attempt == maxAttachmentSaveRetries-1 {
+			break
+		}
+
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return nil, ctx.Err()
 		case <-timer.C:
 		}
+
+		if delay < maxRetryDelay {
+			delay *= 2
+			if delay > maxRetryDelay {
+				delay = maxRetryDelay
+			}
+		}
 	}
+
+	if lastErr == nil {
+		lastErr = errors.New("sqlite busy")
+	}
+
 	return nil, lastErr
 }
 
 func isSQLiteBusy(err error) bool {
 	if err == nil {
 		return false
+	}
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) {
+		switch sqliteErr.Code {
+		case sqlite3.ErrBusy, sqlite3.ErrLocked:
+			return true
+		}
 	}
 	errMsg := err.Error()
 	return strings.Contains(errMsg, "database is locked") || strings.Contains(errMsg, "SQLITE_BUSY")
