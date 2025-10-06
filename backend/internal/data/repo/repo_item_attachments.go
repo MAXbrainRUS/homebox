@@ -250,23 +250,9 @@ func (r *AttachmentRepo) Create(ctx context.Context, itemID uuid.UUID, doc ItemC
 	}
 	mimeType := http.DetectContentType(file[:min(512, len(file))])
 
-	const maxAttachmentSaveRetries = 10
-	const retryDelay = 100 * time.Millisecond
-
-	var attachmentDb *ent.Attachment
-	var saveErr error
-	for attempt := 0; attempt < maxAttachmentSaveRetries; attempt++ {
-		attachmentDb, saveErr = buildAttachment(path, mimeType).Save(ctx)
-		if saveErr == nil {
-			break
-		}
-		if !isSQLiteBusy(saveErr) {
-			break
-		}
-		log.Warn().Err(saveErr).Int("attempt", attempt+1).Msg("retrying attachment save due to sqlite busy")
-		backoff := retryDelay * time.Duration(attempt+1)
-		time.Sleep(backoff)
-	}
+	attachmentDb, saveErr := saveAttachmentWithRetry(ctx, func() *ent.AttachmentCreate {
+		return buildAttachment(path, mimeType)
+	})
 	if saveErr != nil {
 		log.Err(saveErr).Msg("failed to save attachment to database")
 		err = tx.Rollback()
@@ -837,6 +823,33 @@ func (r *AttachmentRepo) UploadFile(ctx context.Context, itemGroup *ent.Group, d
 func isImageFile(mimetype string) bool {
 	// Check file extension for image types
 	return strings.Contains(mimetype, "image/jpeg") || strings.Contains(mimetype, "image/png") || strings.Contains(mimetype, "image/gif")
+}
+
+func saveAttachmentWithRetry(ctx context.Context, builder func() *ent.AttachmentCreate) (*ent.Attachment, error) {
+	const maxAttachmentSaveRetries = 5
+	const retryDelay = 50 * time.Millisecond
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttachmentSaveRetries; attempt++ {
+		attachmentDb, err := builder().Save(ctx)
+		if err == nil {
+			return attachmentDb, nil
+		}
+		if !isSQLiteBusy(err) {
+			return nil, err
+		}
+		lastErr = err
+		log.Warn().Err(err).Int("attempt", attempt+1).Msg("retrying attachment save due to sqlite busy")
+		backoff := retryDelay * time.Duration(attempt+1)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, lastErr
 }
 
 func isSQLiteBusy(err error) bool {
