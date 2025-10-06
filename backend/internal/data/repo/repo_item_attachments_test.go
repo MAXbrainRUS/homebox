@@ -1,7 +1,12 @@
 package repo
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -151,6 +156,18 @@ func TestAttachmentRepo_EnsureSinglePrimaryAttachment(t *testing.T) {
 
 	setAndVerifyPrimary(attachments[0].ID, attachments[1].ID)
 	setAndVerifyPrimary(attachments[1].ID, attachments[0].ID)
+}
+
+func TestReadImageOrientation_HeicFallback(t *testing.T) {
+	encodedContent, err := os.ReadFile(filepath.Join("testdata", "iphone-rotate.heic.base64"))
+	require.NoError(t, err)
+
+	content, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(encodedContent)))
+	require.NoError(t, err)
+
+	orientation, err := readImageOrientation(content)
+	require.NoError(t, err)
+	assert.Equal(t, uint16(6), orientation)
 }
 
 func TestAttachmentRepo_UpdateNonPhotoDoesNotAffectPrimaryPhoto(t *testing.T) {
