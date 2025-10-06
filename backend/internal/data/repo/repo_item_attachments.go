@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"image"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/evanoberholster/imagemeta"
+	"github.com/evanoberholster/imagemeta/isobmff"
 	"github.com/gen2brain/avif"
 	"github.com/gen2brain/heic"
 	"github.com/gen2brain/jpegxl"
@@ -558,7 +560,7 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 			return err
 		}
 		log.Debug().Msg("reading original file orientation")
-		orientation, err := readImageOrientation(contentBytes)
+		orientation, err := readImageOrientation(contentBytes, contentType)
 		if err != nil {
 			log.Err(err).Msg("failed to decode original file content")
 			err := tx.Rollback()
@@ -588,7 +590,7 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 			return err
 		}
 		log.Debug().Msg("reading original file orientation")
-		orientation, err := readImageOrientation(contentBytes)
+		orientation, err := readImageOrientation(contentBytes, contentType)
 		if err != nil {
 			log.Err(err).Msg("failed to decode original file content")
 			err := tx.Rollback()
@@ -638,9 +640,9 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 			return err
 		}
 		log.Debug().Msg("reading original file orientation")
-		orientation, err := readImageOrientation(contentBytes)
+		orientation, err := readImageOrientation(contentBytes, contentType)
 		if err != nil {
-			if errors.Is(err, imagemeta.ErrMetadataNotSupported) || errors.Is(err, imagemeta.ErrNoExif) {
+			if errors.Is(err, imagemeta.ErrMetadataNotSupported) || errors.Is(err, imagemeta.ErrNoExif) || errors.Is(err, errHeicOrientationNotFound) {
 				log.Warn().Err(err).Msg("using default orientation for heic file")
 			} else {
 				log.Err(err).Msg("failed to decode original file content")
@@ -843,19 +845,473 @@ func calculateThumbnailDimensions(origWidth, origHeight, maxWidth, maxHeight int
 	return newWidth, newHeight
 }
 
-func readImageOrientation(contentBytes []byte) (uint16, error) {
+var (
+	errHeicOrientationNotFound   = errors.New("heic orientation not found")
+	errHeicAssociationsNotParsed = errors.New("heic property associations missing")
+)
+
+func readImageOrientation(contentBytes []byte, contentType string) (uint16, error) {
 	const defaultOrientation = uint16(1)
 
 	imageMeta, err := imagemeta.Decode(bytes.NewReader(contentBytes))
 	if err != nil {
+		if isHeicMime(contentType) && (errors.Is(err, imagemeta.ErrMetadataNotSupported) || errors.Is(err, imagemeta.ErrNoExif)) {
+			return readHeicOrientation(contentBytes)
+		}
 		return defaultOrientation, err
 	}
 
-	if imageMeta.Orientation == 0 {
-		return defaultOrientation, nil
+	orientation := uint16(imageMeta.Orientation)
+	if isHeicMime(contentType) {
+		if orientation == 0 {
+			return readHeicOrientation(contentBytes)
+		}
+		if orientation <= 1 {
+			heicOrientation, err := readHeicOrientation(contentBytes)
+			if err == nil {
+				return heicOrientation, nil
+			}
+			if errors.Is(err, errHeicOrientationNotFound) {
+				return orientation, nil
+			}
+			return orientation, err
+		}
 	}
 
-	return uint16(imageMeta.Orientation), nil
+	return orientation, nil
+}
+
+func readHeicOrientation(contentBytes []byte) (uint16, error) {
+	const defaultOrientation = uint16(1)
+
+	reader := isobmff.NewReader(bytes.NewReader(contentBytes))
+	if err := reader.ReadFTYP(); err != nil {
+		reader.Close()
+		return defaultOrientation, err
+	}
+	reader.Close()
+
+	orientation, err := parseHeicOrientation(contentBytes)
+	if err != nil {
+		return defaultOrientation, err
+	}
+	if orientation == 0 {
+		return defaultOrientation, errHeicOrientationNotFound
+	}
+	return orientation, nil
+}
+
+func parseHeicOrientation(data []byte) (uint16, error) {
+	offset := 0
+	for offset < len(data) {
+		size, boxType, headerLen, err := readBoxHeader(data[offset:])
+		if err != nil {
+			return 0, err
+		}
+		end := offset + int(size)
+		if end > len(data) {
+			return 0, fmt.Errorf("meta box exceeds buffer: %w", isobmff.ErrRemainLengthInsufficient)
+		}
+		if boxType == "meta" {
+			return parseMetaBox(data[offset+headerLen : end])
+		}
+		if size == 0 {
+			break
+		}
+		offset += int(size)
+	}
+	return 0, errHeicOrientationNotFound
+}
+
+func parseMetaBox(data []byte) (uint16, error) {
+	if len(data) < 4 {
+		return 0, fmt.Errorf("meta payload too small: %w", isobmff.ErrRemainLengthInsufficient)
+	}
+	payload := data[4:]
+	var primaryID uint32
+	properties := map[uint16]heicItemProperty{}
+	associations := map[uint32][]uint16{}
+	var associationsErr error
+
+	for len(payload) > 0 {
+		size, boxType, headerLen, err := readBoxHeader(payload)
+		if err != nil {
+			return 0, err
+		}
+		if int(size) > len(payload) {
+			return 0, fmt.Errorf("meta child box exceeds payload: %w", isobmff.ErrRemainLengthInsufficient)
+		}
+		start := headerLen
+		end := int(size)
+		content := payload[start:end]
+		switch boxType {
+		case "pitm":
+			primaryID, err = parsePitm(content)
+			if err != nil {
+				return 0, err
+			}
+		case "iprp":
+			props, assoc, err := parseIprp(content)
+			if err != nil && !errors.Is(err, errHeicAssociationsNotParsed) {
+				return 0, err
+			}
+			for idx, prop := range props {
+				existing := properties[idx]
+				if prop.hasRotation {
+					existing.rotationSteps = prop.rotationSteps
+					existing.hasRotation = true
+				}
+				if prop.hasMirror {
+					existing.mirrorAxis = prop.mirrorAxis
+					existing.hasMirror = true
+				}
+				properties[idx] = existing
+			}
+			for item, list := range assoc {
+				associations[item] = append(associations[item], list...)
+			}
+			if err != nil && errors.Is(err, errHeicAssociationsNotParsed) {
+				associationsErr = err
+			}
+		}
+		if size == 0 {
+			break
+		}
+		payload = payload[int(size):]
+	}
+
+	indices := associations[primaryID]
+	if len(indices) == 0 {
+		if orientation, ok := resolveHeicOrientationWithoutAssociations(properties); ok {
+			return orientation, nil
+		}
+		if associationsErr != nil {
+			return 0, errors.Join(errHeicOrientationNotFound, associationsErr)
+		}
+		return 0, errHeicOrientationNotFound
+	}
+
+	var rotationSteps int
+	var mirrorAxis *int
+	var mirrorAxisValue int
+	for _, idx := range indices {
+		if prop, ok := properties[idx]; ok {
+			if prop.hasRotation {
+				rotationSteps = prop.rotationSteps
+			}
+			if prop.hasMirror {
+				mirrorAxisValue = prop.mirrorAxis
+				mirrorAxis = &mirrorAxisValue
+			}
+		}
+	}
+
+	orientation := orientationFromHeic(rotationSteps, mirrorAxis)
+	if orientation == 0 {
+		if associationsErr != nil {
+			return 0, errors.Join(errHeicOrientationNotFound, associationsErr)
+		}
+		return 0, errHeicOrientationNotFound
+	}
+	return orientation, nil
+}
+
+func parsePitm(data []byte) (uint32, error) {
+	if len(data) < 4 {
+		return 0, fmt.Errorf("pitm payload too small: %w", isobmff.ErrRemainLengthInsufficient)
+	}
+	version := data[0]
+	offset := 4
+	if version == 0 {
+		if len(data) < offset+2 {
+			return 0, fmt.Errorf("pitm short payload: %w", isobmff.ErrRemainLengthInsufficient)
+		}
+		return uint32(binary.BigEndian.Uint16(data[offset : offset+2])), nil
+	}
+	if len(data) < offset+4 {
+		return 0, fmt.Errorf("pitm short payload: %w", isobmff.ErrRemainLengthInsufficient)
+	}
+	return binary.BigEndian.Uint32(data[offset : offset+4]), nil
+}
+
+type heicItemProperty struct {
+	rotationSteps int
+	hasRotation   bool
+	mirrorAxis    int
+	hasMirror     bool
+}
+
+func parseIprp(data []byte) (map[uint16]heicItemProperty, map[uint32][]uint16, error) {
+	props := make(map[uint16]heicItemProperty)
+	associations := make(map[uint32][]uint16)
+	buf := data
+	var assocErr error
+	for len(buf) > 0 {
+		size, boxType, headerLen, err := readBoxHeader(buf)
+		if err != nil {
+			return nil, nil, err
+		}
+		if int(size) > len(buf) {
+			return nil, nil, fmt.Errorf("iprp child box exceeds payload: %w", isobmff.ErrRemainLengthInsufficient)
+		}
+		start := headerLen
+		end := int(size)
+		content := buf[start:end]
+		switch boxType {
+		case "ipco":
+			parsed, err := parseIpco(content)
+			if err != nil {
+				return nil, nil, err
+			}
+			for idx, prop := range parsed {
+				props[idx] = prop
+			}
+		case "ipma":
+			assoc, err := parseIpma(content)
+			if err != nil {
+				assocErr = fmt.Errorf("%w: %w", errHeicAssociationsNotParsed, err)
+				break
+			}
+			for item, list := range assoc {
+				associations[item] = append(associations[item], list...)
+			}
+		}
+		if size == 0 {
+			break
+		}
+		buf = buf[int(size):]
+	}
+	if assocErr != nil && len(associations) == 0 {
+		return props, associations, assocErr
+	}
+	return props, associations, assocErr
+}
+
+func parseIpco(data []byte) (map[uint16]heicItemProperty, error) {
+	props := make(map[uint16]heicItemProperty)
+	buf := data
+	index := uint16(1)
+	for len(buf) > 0 {
+		if len(buf) >= 16 {
+			size32 := binary.BigEndian.Uint32(buf[:4])
+			if size32 == 1 {
+				largeSize := binary.BigEndian.Uint64(buf[8:16])
+				if largeSize > uint64(len(buf)) {
+					break
+				}
+			}
+		}
+		size, boxType, headerLen, err := readBoxHeader(buf)
+		if err != nil {
+			return nil, err
+		}
+		if int(size) > len(buf) {
+			break
+		}
+		start := headerLen
+		end := int(size)
+		content := buf[start:end]
+		switch boxType {
+		case "irot":
+			if len(content) > 0 {
+				value := content[len(content)-1] & 0x3
+				props[index] = heicItemProperty{rotationSteps: int(value), hasRotation: true}
+			}
+		case "imir":
+			if len(content) > 0 {
+				axis := int(content[len(content)-1] & 0x1)
+				props[index] = heicItemProperty{mirrorAxis: axis, hasMirror: true}
+			}
+		}
+		if size == 0 {
+			break
+		}
+		buf = buf[int(size):]
+		index++
+	}
+	return props, nil
+}
+
+func parseIpma(data []byte) (map[uint32][]uint16, error) {
+	if len(data) < 8 {
+		return nil, fmt.Errorf("ipma payload too small: %w", isobmff.ErrRemainLengthInsufficient)
+	}
+	version := data[0]
+	flags := uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
+	count := binary.BigEndian.Uint32(data[4:8])
+	use16 := flags&0x1 != 0
+	offset := 8
+	associations := make(map[uint32][]uint16)
+
+	for i := uint32(0); i < count; i++ {
+		var itemID uint32
+		if version == 0 {
+			if len(data) < offset+2 {
+				return nil, fmt.Errorf("ipma item payload too small: %w", isobmff.ErrRemainLengthInsufficient)
+			}
+			itemID = uint32(binary.BigEndian.Uint16(data[offset : offset+2]))
+			offset += 2
+		} else {
+			if len(data) < offset+4 {
+				return nil, fmt.Errorf("ipma item payload too small: %w", isobmff.ErrRemainLengthInsufficient)
+			}
+			itemID = binary.BigEndian.Uint32(data[offset : offset+4])
+			offset += 4
+		}
+		if len(data) <= offset {
+			return nil, fmt.Errorf("ipma association count missing: %w", isobmff.ErrRemainLengthInsufficient)
+		}
+		assocCount := int(data[offset])
+		offset++
+		for j := 0; j < assocCount; j++ {
+			if use16 {
+				if len(data) < offset+2 {
+					return nil, fmt.Errorf("ipma association payload too small: %w", isobmff.ErrRemainLengthInsufficient)
+				}
+				entry := binary.BigEndian.Uint16(data[offset : offset+2])
+				offset += 2
+				index := entry & 0x7FFF
+				if index != 0 {
+					associations[itemID] = append(associations[itemID], index)
+				}
+			} else {
+				if len(data) <= offset {
+					return nil, fmt.Errorf("ipma association payload too small: %w", isobmff.ErrRemainLengthInsufficient)
+				}
+				entry := data[offset]
+				offset++
+				index := uint16(entry & 0x7F)
+				if index != 0 {
+					associations[itemID] = append(associations[itemID], index)
+				}
+			}
+		}
+	}
+	return associations, nil
+}
+
+func readBoxHeader(data []byte) (uint64, string, int, error) {
+	if len(data) < 8 {
+		return 0, "", 0, fmt.Errorf("box header too small: %w", isobmff.ErrRemainLengthInsufficient)
+	}
+	size32 := binary.BigEndian.Uint32(data[:4])
+	boxType := string(data[4:8])
+	headerLen := 8
+	var size uint64
+	switch size32 {
+	case 0:
+		size = uint64(len(data))
+	case 1:
+		if len(data) < 16 {
+			return 0, "", 0, fmt.Errorf("large box header too small: %w", isobmff.ErrRemainLengthInsufficient)
+		}
+		size = binary.BigEndian.Uint64(data[8:16])
+		headerLen = 16
+	default:
+		size = uint64(size32)
+	}
+	if size < uint64(headerLen) {
+		return 0, "", 0, fmt.Errorf("invalid box size: %w", isobmff.ErrRemainLengthInsufficient)
+	}
+	if size > uint64(len(data)) && size32 != 0 {
+		return 0, "", 0, fmt.Errorf("box exceeds payload: %w", isobmff.ErrRemainLengthInsufficient)
+	}
+	return size, boxType, headerLen, nil
+}
+
+func resolveHeicOrientationWithoutAssociations(properties map[uint16]heicItemProperty) (uint16, bool) {
+	var rotationSteps int
+	var rotationCount int
+	var mirrorAxisValue int
+	var mirrorCount int
+
+	for _, prop := range properties {
+		if prop.hasRotation {
+			rotationSteps = prop.rotationSteps
+			rotationCount++
+		}
+		if prop.hasMirror {
+			mirrorAxisValue = prop.mirrorAxis
+			mirrorCount++
+		}
+	}
+
+	if rotationCount > 1 || mirrorCount > 1 {
+		return 0, false
+	}
+	if rotationCount == 0 && mirrorCount == 0 {
+		return 0, false
+	}
+
+	var mirrorAxis *int
+	if mirrorCount == 1 {
+		mirrorAxis = &mirrorAxisValue
+	}
+
+	orientation := orientationFromHeic(rotationSteps, mirrorAxis)
+	if orientation == 0 {
+		return 0, false
+	}
+	return orientation, true
+}
+
+type heicTransform struct {
+	ax, ay int
+	bx, by int
+}
+
+func multiplyTransform(a, b heicTransform) heicTransform {
+	return heicTransform{
+		ax: a.ax*b.ax + a.bx*b.ay,
+		ay: a.ay*b.ax + a.by*b.ay,
+		bx: a.ax*b.bx + a.bx*b.by,
+		by: a.ay*b.bx + a.by*b.by,
+	}
+}
+
+var (
+	identityTransform   = heicTransform{ax: 1, ay: 0, bx: 0, by: 1}
+	rotate90Transform   = heicTransform{ax: 0, ay: -1, bx: 1, by: 0}
+	mirrorHorizontal    = heicTransform{ax: -1, ay: 0, bx: 0, by: 1}
+	mirrorVertical      = heicTransform{ax: 1, ay: 0, bx: 0, by: -1}
+	orientationMappings = map[heicTransform]uint16{
+		{ax: 1, ay: 0, bx: 0, by: 1}:   1,
+		{ax: -1, ay: 0, bx: 0, by: 1}:  2,
+		{ax: -1, ay: 0, bx: 0, by: -1}: 3,
+		{ax: 1, ay: 0, bx: 0, by: -1}:  4,
+		{ax: 0, ay: 1, bx: 1, by: 0}:   5,
+		{ax: 0, ay: -1, bx: 1, by: 0}:  6,
+		{ax: 0, ay: -1, bx: -1, by: 0}: 7,
+		{ax: 0, ay: 1, bx: -1, by: 0}:  8,
+	}
+)
+
+func orientationFromHeic(rotationSteps int, mirrorAxis *int) uint16 {
+	transform := identityTransform
+	if mirrorAxis != nil {
+		if *mirrorAxis == 0 {
+			transform = multiplyTransform(mirrorHorizontal, transform)
+		} else {
+			transform = multiplyTransform(mirrorVertical, transform)
+		}
+	}
+	rotationSteps = ((rotationSteps % 4) + 4) % 4
+	for i := 0; i < rotationSteps; i++ {
+		transform = multiplyTransform(rotate90Transform, transform)
+	}
+	if orientation, ok := orientationMappings[transform]; ok {
+		return orientation
+	}
+	return 0
+}
+
+func isHeicMime(contentType string) bool {
+	switch contentType {
+	case "image/heic", "image/heif":
+		return true
+	default:
+		return false
+	}
 }
 
 // processThumbnailFromImage handles the common thumbnail processing logic after image decoding
