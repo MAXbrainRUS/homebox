@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"image"
@@ -558,7 +559,7 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 			return err
 		}
 		log.Debug().Msg("reading original file orientation")
-		orientation, err := readImageOrientation(contentBytes)
+		orientation, err := readImageOrientation(contentBytes, contentType)
 		if err != nil {
 			log.Err(err).Msg("failed to decode original file content")
 			err := tx.Rollback()
@@ -588,7 +589,7 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 			return err
 		}
 		log.Debug().Msg("reading original file orientation")
-		orientation, err := readImageOrientation(contentBytes)
+		orientation, err := readImageOrientation(contentBytes, contentType)
 		if err != nil {
 			log.Err(err).Msg("failed to decode original file content")
 			err := tx.Rollback()
@@ -638,7 +639,7 @@ func (r *AttachmentRepo) CreateThumbnail(ctx context.Context, groupId, attachmen
 			return err
 		}
 		log.Debug().Msg("reading original file orientation")
-		orientation, err := readImageOrientation(contentBytes)
+		orientation, err := readImageOrientation(contentBytes, contentType)
 		if err != nil {
 			if errors.Is(err, imagemeta.ErrMetadataNotSupported) || errors.Is(err, imagemeta.ErrNoExif) {
 				log.Warn().Err(err).Msg("using default orientation for heic file")
@@ -843,19 +844,213 @@ func calculateThumbnailDimensions(origWidth, origHeight, maxWidth, maxHeight int
 	return newWidth, newHeight
 }
 
-func readImageOrientation(contentBytes []byte) (uint16, error) {
+var errHeifOrientationNotFound = errors.New("heif orientation not found")
+
+func readImageOrientation(contentBytes []byte, contentType string) (uint16, error) {
 	const defaultOrientation = uint16(1)
 
+	var heifErr error
+	if isHeifContentType(contentType) {
+		if orientation, err := extractHeifOrientation(contentBytes); err == nil {
+			return orientation, nil
+		} else if !errors.Is(err, errHeifOrientationNotFound) {
+			heifErr = err
+		}
+	}
+
 	imageMeta, err := imagemeta.Decode(bytes.NewReader(contentBytes))
+	if err == nil {
+		if imageMeta.Orientation == 0 {
+			return defaultOrientation, nil
+		}
+		return uint16(imageMeta.Orientation), nil
+	}
+
+	if heifErr != nil {
+		return defaultOrientation, errors.Join(err, heifErr)
+	}
+
+	return defaultOrientation, err
+}
+
+func isHeifContentType(contentType string) bool {
+	switch contentType {
+	case "image/heic", "image/heif":
+		return true
+	default:
+		return false
+	}
+}
+
+func extractHeifOrientation(contentBytes []byte) (uint16, error) {
+	rotation, mirrorAxis, hasMirror, err := parseHeifTransforms(contentBytes)
 	if err != nil {
-		return defaultOrientation, err
+		return 0, err
+	}
+	return heifTransformToOrientation(rotation, mirrorAxis, hasMirror), nil
+}
+
+func parseHeifTransforms(contentBytes []byte) (rotation uint8, mirrorAxis uint8, hasMirror bool, err error) {
+	var hasRotation bool
+	err = walkIsoBoxes(contentBytes, func(boxType string, payload []byte) (bool, error) {
+		if boxType != "meta" {
+			return false, nil
+		}
+		if len(payload) < 4 {
+			return false, nil
+		}
+
+		metaPayload := payload[4:]
+		err := walkIsoBoxes(metaPayload, func(boxType string, payload []byte) (bool, error) {
+			if boxType != "iprp" {
+				return false, nil
+			}
+
+			err := walkIsoBoxes(payload, func(boxType string, payload []byte) (bool, error) {
+				if boxType != "ipco" {
+					return false, nil
+				}
+
+				err := walkIsoBoxes(payload, func(boxType string, payload []byte) (bool, error) {
+					switch boxType {
+					case "irot":
+						if len(payload) >= 1 {
+							rotation = payload[0] & 0x3
+							hasRotation = true
+						}
+					case "imir":
+						if len(payload) >= 1 {
+							mirrorAxis = payload[0] & 0x1
+							hasMirror = true
+						}
+					}
+					if hasRotation && hasMirror {
+						return true, nil
+					}
+					return false, nil
+				})
+				if err != nil {
+					return false, err
+				}
+				if hasRotation || hasMirror {
+					return true, nil
+				}
+				return false, nil
+			})
+			if err != nil {
+				return false, err
+			}
+			if hasRotation || hasMirror {
+				return true, nil
+			}
+			return false, nil
+		})
+		if err != nil {
+			return false, err
+		}
+		if hasRotation || hasMirror {
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if !hasRotation && !hasMirror {
+		return 0, 0, false, errHeifOrientationNotFound
+	}
+	return rotation, mirrorAxis, hasMirror, nil
+}
+
+func heifTransformToOrientation(rotation uint8, mirrorAxis uint8, hasMirror bool) uint16 {
+	rot := rotation % 4
+	if !hasMirror {
+		switch rot {
+		case 0:
+			return 1
+		case 1:
+			return 6
+		case 2:
+			return 3
+		case 3:
+			return 8
+		}
+		return 1
 	}
 
-	if imageMeta.Orientation == 0 {
-		return defaultOrientation, nil
+	switch mirrorAxis {
+	case 0:
+		switch rot {
+		case 0:
+			return 2
+		case 1:
+			return 7
+		case 2:
+			return 4
+		case 3:
+			return 5
+		}
+	case 1:
+		switch rot {
+		case 0:
+			return 4
+		case 1:
+			return 5
+		case 2:
+			return 2
+		case 3:
+			return 7
+		}
 	}
 
-	return uint16(imageMeta.Orientation), nil
+	return 1
+}
+
+func walkIsoBoxes(data []byte, fn func(boxType string, payload []byte) (bool, error)) error {
+	for offset := 0; offset+8 <= len(data); {
+		size := binary.BigEndian.Uint32(data[offset : offset+4])
+		headerSize := 8
+		var boxSize uint64
+
+		switch size {
+		case 0:
+			boxSize = uint64(len(data) - offset)
+		case 1:
+			if offset+16 > len(data) {
+				return fmt.Errorf("invalid extended box size")
+			}
+			boxSize = binary.BigEndian.Uint64(data[offset+8 : offset+16])
+			headerSize = 16
+		default:
+			boxSize = uint64(size)
+		}
+
+		if boxSize < uint64(headerSize) {
+			return fmt.Errorf("invalid box size")
+		}
+		end := offset + int(boxSize)
+		if end > len(data) {
+			return fmt.Errorf("box exceeds data length")
+		}
+
+		boxType := string(data[offset+4 : offset+8])
+		payloadStart := offset + headerSize
+		payload := data[payloadStart:end]
+
+		stop, err := fn(boxType, payload)
+		if err != nil {
+			return err
+		}
+		if stop {
+			return nil
+		}
+
+		if boxSize == 0 {
+			return nil
+		}
+		offset = end
+	}
+	return nil
 }
 
 // processThumbnailFromImage handles the common thumbnail processing logic after image decoding

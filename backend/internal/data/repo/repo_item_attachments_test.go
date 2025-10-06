@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -280,4 +281,56 @@ func TestAttachmentRepo_SettingPhotoPrimaryStillWorks(t *testing.T) {
 	photo1, err = tRepos.Attachments.Get(ctx, tGroup.ID, photo1.ID)
 	require.NoError(t, err)
 	assert.False(t, photo1.Primary, "Photo 1 should no longer be primary after setting Photo 2 as primary")
+}
+
+const portraitHEICBase64 = "AAAAJW1ldGEAAAAAAAAAGWlwcnAAAAARaXBjbwAAAAlpcm90AQ=="
+
+func TestReadImageOrientationHEICFallback(t *testing.T) {
+	content := mustDecodeBase64(t, portraitHEICBase64)
+
+	rotation, axis, hasMirror, err := parseHeifTransforms(content)
+	require.NoError(t, err)
+	assert.Equal(t, uint8(1), rotation)
+	assert.False(t, hasMirror)
+	assert.Equal(t, uint8(0), axis)
+
+	fallback, err := extractHeifOrientation(content)
+	require.NoError(t, err)
+	assert.Equal(t, uint16(6), fallback)
+
+	orientation, err := readImageOrientation(content, "image/heic")
+	require.NoError(t, err)
+	assert.Equal(t, uint16(6), orientation)
+}
+
+func mustDecodeBase64(t *testing.T, data string) []byte {
+	t.Helper()
+
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	require.NoError(t, err)
+	return decoded
+}
+
+func TestHeifTransformToOrientation(t *testing.T) {
+	tests := []struct {
+		name      string
+		rotation  uint8
+		axis      uint8
+		hasMirror bool
+		want      uint16
+	}{
+		{name: "no mirror rotation 0", rotation: 0, hasMirror: false, want: 1},
+		{name: "no mirror rotation 90", rotation: 1, hasMirror: false, want: 6},
+		{name: "mirror axis 0 rotation 0", rotation: 0, axis: 0, hasMirror: true, want: 2},
+		{name: "mirror axis 0 rotation 90", rotation: 1, axis: 0, hasMirror: true, want: 7},
+		{name: "mirror axis 1 rotation 0", rotation: 0, axis: 1, hasMirror: true, want: 4},
+		{name: "mirror axis 1 rotation 270", rotation: 3, axis: 1, hasMirror: true, want: 7},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := heifTransformToOrientation(tt.rotation, tt.axis, tt.hasMirror)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
