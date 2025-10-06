@@ -159,16 +159,26 @@ func (r *AttachmentRepo) Create(ctx context.Context, itemID uuid.UUID, doc ItemC
 
 	bldrId := uuid.New()
 
-	bldr := tx.Attachment.Create().
-		SetID(bldrId).
-		SetCreatedAt(time.Now()).
-		SetUpdatedAt(time.Now()).
-		SetType(typ).
-		SetItemID(itemID).
-		SetTitle(doc.Title)
+	now := time.Now()
+	setPrimary := false
+	buildAttachment := func(path string, mimeType string) *ent.AttachmentCreate {
+		builder := tx.Attachment.Create().
+			SetID(bldrId).
+			SetCreatedAt(now).
+			SetUpdatedAt(now).
+			SetType(typ).
+			SetItemID(itemID).
+			SetTitle(doc.Title).
+			SetPath(path).
+			SetMimeType(mimeType)
+		if setPrimary {
+			builder = builder.SetPrimary(true)
+		}
+		return builder
+	}
 
 	if typ == attachment.TypePhoto && primary {
-		bldr = bldr.SetPrimary(true)
+		setPrimary = true
 		err := r.db.Attachment.Update().
 			Where(
 				attachment.HasItemWith(item.ID(itemID)),
@@ -203,7 +213,7 @@ func (r *AttachmentRepo) Create(ctx context.Context, itemID uuid.UUID, doc ItemC
 		}
 
 		if cnt == 0 {
-			bldr = bldr.SetPrimary(true)
+			setPrimary = true
 		}
 	}
 
@@ -238,17 +248,32 @@ func (r *AttachmentRepo) Create(ctx context.Context, itemID uuid.UUID, doc ItemC
 		}
 		return nil, err
 	}
-	bldr = bldr.SetMimeType(http.DetectContentType(file[:min(512, len(file))]))
-	bldr = bldr.SetPath(path)
+	mimeType := http.DetectContentType(file[:min(512, len(file))])
 
-	attachmentDb, err := bldr.Save(ctx)
-	if err != nil {
-		log.Err(err).Msg("failed to save attachment to database")
+	const maxAttachmentSaveRetries = 10
+	const retryDelay = 100 * time.Millisecond
+
+	var attachmentDb *ent.Attachment
+	var saveErr error
+	for attempt := 0; attempt < maxAttachmentSaveRetries; attempt++ {
+		attachmentDb, saveErr = buildAttachment(path, mimeType).Save(ctx)
+		if saveErr == nil {
+			break
+		}
+		if !isSQLiteBusy(saveErr) {
+			break
+		}
+		log.Warn().Err(saveErr).Int("attempt", attempt+1).Msg("retrying attachment save due to sqlite busy")
+		backoff := retryDelay * time.Duration(attempt+1)
+		time.Sleep(backoff)
+	}
+	if saveErr != nil {
+		log.Err(saveErr).Msg("failed to save attachment to database")
 		err = tx.Rollback()
 		if err != nil {
 			return nil, err
 		}
-		return nil, err
+		return nil, saveErr
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -812,6 +837,14 @@ func (r *AttachmentRepo) UploadFile(ctx context.Context, itemGroup *ent.Group, d
 func isImageFile(mimetype string) bool {
 	// Check file extension for image types
 	return strings.Contains(mimetype, "image/jpeg") || strings.Contains(mimetype, "image/png") || strings.Contains(mimetype, "image/gif")
+}
+
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := err.Error()
+	return strings.Contains(errMsg, "database is locked") || strings.Contains(errMsg, "SQLITE_BUSY")
 }
 
 // calculateThumbnailDimensions calculates new dimensions that preserve aspect ratio
